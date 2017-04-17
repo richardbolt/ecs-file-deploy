@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+
+# Pretty much all code borrowed from https://github.com/silinternational/ecs-deploy/blob/develop/ecs-deploy
+# MIT LICENSE. See LICENSE file for details.
+# Trimmed down from ecs-deploy to require the presence of an ECS JSON container definition file.
+# Just suits our infrastructure as code patter a bit closer than the original, awesome, ecs-deploy.
+CLUSTER=false
+SERVICE=false
+TASK_DEFINITION_NAME=false
+TASK_DEFINITION_FILE="ecs-service.json"
+TIMEOUT=120
+VERBOSE=false
+
+AWS_CLI=$(which aws)
+AWS_ECS="$AWS_CLI --output json ecs"
+
+
+function usage() {
+    cat <<EOM
+##### ecs-file-deploy #####
+Script for triggering blue/green deployments on Amazon Elastic Container Service given a speficic Task Definition JSON file.
+
+Required arguments:
+    -k | --aws-access-key        AWS Access Key ID. May also be set as environment variable AWS_ACCESS_KEY_ID
+    -s | --aws-secret-key        AWS Secret Access Key. May also be set as environment variable AWS_SECRET_ACCESS_KEY
+    -r | --region                AWS Region Name. May also be set as environment variable AWS_DEFAULT_REGION
+    -p | --profile               AWS Profile to use - If you set this aws-access-key, aws-secret-key and region are needed
+    -c | --cluster               Name of ECS cluster
+    -n | --service-name          Name of service to deploy
+Optional arguments:
+    -f | --task-file             Default is 'ecs-service.json'. Filename of the configured ECS task definition file.
+    -t | --timeout               Default is 90s. Script monitors ECS Service for new task definition to be running.
+    -v | --verbose               Verbose output
+Requirements:
+    aws:  AWS Command Line Interface
+    jq:   Command-line JSON processor
+Examples:
+  Simple deployment of a service (Using env vars for AWS settings):
+    ecs-file-deploy -c production1 -n doorman-service
+  All options:
+    ecs-file-deploy -k ABC123 -s SECRETKEY -r us-east-1 -c production1 -n doorman-service -f doorman-definition.json -t 240 -v
+  Using profiles (for STS delegated credentials, for instance):
+    ecs-file-deploy -p PROFILE -c production1 -n doorman-service
+EOM
+
+    exit 3
+}
+
+
+# Check requirements
+function require() {
+    command -v "$1" > /dev/null 2>&1 || {
+        echo "Some of the required software is not installed:"
+        echo "    please install $1" >&2;
+        exit 4;
+    }
+}
+
+# Check that all required variables/combinations are set
+function assertRequiredArgumentsSet() {
+
+    # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION and AWS_PROFILE can be set as environment variables
+    if [ -z ${AWS_ACCESS_KEY_ID+x} ]; then unset AWS_ACCESS_KEY_ID; fi
+    if [ -z ${AWS_SECRET_ACCESS_KEY+x} ]; then unset AWS_SECRET_ACCESS_KEY; fi
+    if [ -z ${AWS_DEFAULT_REGION+x} ];
+      then unset AWS_DEFAULT_REGION
+      else
+              AWS_ECS="$AWS_ECS --region $AWS_DEFAULT_REGION"
+    fi
+    if [ -z ${AWS_PROFILE+x} ];
+      then unset AWS_PROFILE
+      else
+              AWS_ECS="$AWS_ECS --profile $AWS_PROFILE"
+    fi
+
+    if [ $SERVICE == false ]; then
+        echo "SERVICE is required. You can pass the value using -n / --service-name"
+        exit 5
+    fi
+    if [ $CLUSTER == false ]; then
+        echo "CLUSTER is required. You can pass the value using -c or --cluster"
+        exit 7
+    fi
+}
+
+function getCurrentTaskDefinitionName() {
+    if [ $SERVICE != false ]; then
+      # Get current task definition name from service
+      TASK_DEFINITION_ARN=`$AWS_ECS describe-services --services $SERVICE --cluster $CLUSTER | jq -r '.services[0].taskDefinition'`
+      TASK_DEFINITION_NAME=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN | jq -r '.taskDefinition.family'`
+    fi
+}
+
+function registerNewTaskDefinition() {
+    # Register the new task definition, and store its ARN
+    NEW_TASKDEF=`$AWS_ECS register-task-definition --family $TASK_DEFINITION_NAME --cli-input-json file://$TASK_DEFINITION_FILE | jq -r '.taskDefinition.taskDefinitionArn'`
+}
+
+function updateService() {
+    # Update the service
+    UPDATE=`$AWS_ECS update-service --cluster $CLUSTER --service $SERVICE --task-definition $NEW_TASKDEF`
+
+    # Only excepts RUNNING state from services whose desired-count > 0
+    SERVICE_DESIREDCOUNT=`$AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq '.services[]|.desiredCount'`
+    if [ $SERVICE_DESIREDCOUNT -gt 0 ]; then
+        # See if the service is able to come up again
+        every=10
+        i=0
+        while [ $i -lt $TIMEOUT ]
+        do
+            # Scan the list of running tasks for that service, and see if one of them is the
+            # new version of the task definition
+
+            RUNNING_TASKS=$($AWS_ECS list-tasks --cluster "$CLUSTER"  --service-name "$SERVICE" --desired-status RUNNING \
+                | jq -r '.taskArns[]')
+
+            if [[ ! -z $RUNNING_TASKS ]] ; then
+                RUNNING=$($AWS_ECS describe-tasks --cluster "$CLUSTER" --tasks $RUNNING_TASKS \
+                    | jq ".tasks[]| if .taskDefinitionArn == \"$NEW_TASKDEF\" then . else empty end|.lastStatus" \
+                    | grep -e "RUNNING") || :
+
+                if [ "$RUNNING" ]; then
+                    echo "Service updated successfully, new task definition running.";
+
+                    exit 0
+                fi
+            fi
+
+            sleep $every
+            i=$(( $i + $every ))
+        done
+
+        # Timeout
+        echo "ERROR: New task definition not running within $TIMEOUT seconds"
+        exit 1
+    else
+        echo "Skipping check for running task definition, as desired-count <= 0"
+    fi
+}
+
+######################################################
+# When not being tested, run application as expected #
+######################################################
+if [ "$BASH_SOURCE" == "$0" ]; then
+    set -o errexit
+    set -o pipefail
+    set -u
+    set -e
+    # If no args are provided, display usage information
+    if [ $# == 0 ]; then usage; fi
+
+    # Check for AWS, AWS Command Line Interface
+    require aws
+    # Check for jq, Command-line JSON processor
+    require jq
+
+    # Loop through arguments, two at a time for key and value
+    while [[ $# -gt 0 ]]
+    do
+        key="$1"
+
+        case $key in
+            -k|--aws-access-key)
+                AWS_ACCESS_KEY_ID="$2"
+                shift # past argument
+                ;;
+            -s|--aws-secret-key)
+                AWS_SECRET_ACCESS_KEY="$2"
+                shift # past argument
+                ;;
+            -r|--region)
+                AWS_DEFAULT_REGION="$2"
+                shift # past argument
+                ;;
+            -p|--profile)
+                AWS_PROFILE="$2"
+                shift # past argument
+                ;;
+            --aws-instance-profile)
+                echo "--aws-instance-profile is not yet in use"
+                AWS_IAM_ROLE=true
+                ;;
+            -c|--cluster)
+                CLUSTER="$2"
+                shift # past argument
+                ;;
+            -n|--service-name)
+                SERVICE="$2"
+                shift # past argument
+                ;;
+            -f|--task-file)
+                TASK_DEFINITION_FILE="$2"
+                shift
+                ;;
+            -t|--timeout)
+                TIMEOUT="$2"
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                ;;
+            *)
+                usage
+                exit 2
+            ;;
+        esac
+        shift # past argument or value
+    done
+
+    if [ $VERBOSE == true ]; then
+        set -x
+    fi
+
+    # Check that required arguments are provided
+    assertRequiredArgumentsSet
+
+    # Get current task definition
+    getCurrentTaskDefinitionName
+    echo "Current task definition family: $TASK_DEFINITION_NAME";
+
+    # register new task definition
+    registerNewTaskDefinition
+    echo "New task definition: $NEW_TASKDEF";
+
+    # update service
+    updateService
+
+fi
+#############################
+# End application run logic #
+#############################
